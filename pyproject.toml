@@ -1,0 +1,12 @@
+[project]
+name = "image-similarity-clustering-engine"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ipykernel>=6.29.5",
+    "mediapipe>=0.10.21",
+    "opencv-python-headless>=4.11.0.86",
+    "streamlit>=1.45.0",
+]
