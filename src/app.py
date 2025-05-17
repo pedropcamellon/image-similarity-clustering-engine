@@ -1,16 +1,19 @@
-import streamlit as st
-import mediapipe as mp
+from datetime import datetime
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-import cv2
-import numpy as np
+from pydantic import ConfigDict, validate_call
+from models import AppState, ImageData
+from numpy.typing import NDArray
 from scipy.cluster.hierarchy import linkage, fcluster
-import tempfile
+from streamlit.runtime.uploaded_file_manager import UploadedFile
+import cv2
+import mediapipe as mp
+import numpy as np
 import os
-from PIL import Image
+import streamlit as st
 
 
-def setup_page():
+def setup_page() -> None:
     """Configure the Streamlit page settings for the application.
 
     Sets the page title, icon, layout, and initial sidebar state.
@@ -23,7 +26,7 @@ def setup_page():
     )
 
 
-def setup_header():
+def setup_header() -> None:
     """Create the application header with title and description.
 
     Displays the main title, descriptive text, and a divider.
@@ -38,47 +41,84 @@ def setup_header():
     st.divider()
 
 
-def load_image(uploaded_file):
+def init_session_state() -> None:
+    """Initialize the application state with Pydantic models"""
+    if "app_state" not in st.session_state:
+        st.session_state.app_state = AppState()
+    elif not hasattr(st.session_state.app_state, "clustering_config"):
+        st.session_state.app_state = AppState()
+
+
+@validate_call(config=ConfigDict(arbitrary_types_allowed=True))
+def load_image(uploaded_file: UploadedFile) -> NDArray:
     """Convert an uploaded file into an RGB image array.
 
     Args:
         uploaded_file: A Streamlit UploadedFile object containing image data
 
     Returns:
-        numpy.ndarray: RGB image array
+        NDArray: RGB image array
+
+    Raises:
+        ValueError: If file is empty or cannot be decoded
     """
     bytes_data = uploaded_file.getvalue()
+    if not bytes_data:
+        raise ValueError("Empty file provided")
+
     img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # Convert to RGB immediately
+
+    if img is None:
+        raise ValueError("Could not decode image")
+
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 @st.cache_data
-def get_embeddings(images, model_path="models/mobilenet_v3_small.tflite"):
+def get_embeddings(
+    images: dict[str, NDArray], model_path: str = "models/mobilenet_v3_small.tflite"
+) -> list[dict]:
     """Generate embeddings for a set of images using MediaPipe.
 
     Args:
-        images (dict): Dictionary of image name to numpy array pairs
-        model_path (str): Path to the TFLite model file
+        images: Dictionary of image name to numpy array pairs
+        model_path: Path to the TFLite model file
 
     Returns:
-        list: List of dictionaries containing file names and their embeddings
+        list: A list of dictionaries containing file names and their embeddings
+        List of dictionaries containing file names and their embeddings
+
+    Raises:
+        FileNotFoundError: If model file doesn't exist
+        ValueError: If images dict is empty
     """
-    # Initialize MediaPipe Image Embedder with normalized and quantized outputs
+    if not images:
+        raise ValueError("No images provided")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
     base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.ImageEmbedderOptions(
         base_options=base_options, l2_normalize=True, quantize=True
     )
 
+    embedding_results = []
     with vision.ImageEmbedder.create_from_options(options) as embedder:
-        embedding_results = []
         for img_name, img in images.items():
+            if img is None or img.size == 0:
+                continue
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img)
             embedding = embedder.embed(mp_image)
             embedding_results.append({"file_name": img_name, "embeddings": embedding})
+
     return embedding_results
 
 
-def cluster_images(embedding_results, threshold=5500):
+def cluster_images(
+    embedding_results: list[dict],
+    threshold: int = 5500,
+) -> dict[int, list[str]]:
     """Group images into clusters based on their embedding similarities.
 
     Args:
@@ -87,8 +127,17 @@ def cluster_images(embedding_results, threshold=5500):
 
     Returns:
         dict: Mapping of cluster IDs to lists of file names
+        Mapping of cluster IDs to lists of file names
+
+    Raises:
+        ValueError: If embedding_results is empty or threshold is invalid
     """
-    # Convert embeddings to numpy array for clustering
+    if not embedding_results:
+        raise ValueError("No embedding results provided")
+
+    if threshold <= 0:
+        raise ValueError("Threshold must be positive")
+
     embedding_vectors = np.array(
         [result["embeddings"].embeddings[0].embedding for result in embedding_results]
     )
@@ -96,7 +145,7 @@ def cluster_images(embedding_results, threshold=5500):
     linkage_matrix = linkage(embedding_vectors, method="ward")
     labels = fcluster(linkage_matrix, t=threshold, criterion="distance")
 
-    clusters = {}
+    clusters: dict[int, list[str]] = {}
     for idx, label in enumerate(labels):
         if label not in clusters:
             clusters[label] = []
@@ -105,7 +154,7 @@ def cluster_images(embedding_results, threshold=5500):
     return clusters
 
 
-def display_upload_section():
+def display_upload_section() -> None:
     """Render the image upload section of the interface.
 
     Handles multiple image uploads and displays previews in a grid layout.
@@ -116,45 +165,69 @@ def display_upload_section():
     """
     st.subheader("1. Upload Images")
 
-    # Show current count
-    current_count = len(st.session_state.get("uploaded_images", {}))
+    config = st.session_state.app_state.clustering_config
+    current_count = len(st.session_state.app_state.uploaded_images)
+
     if current_count > 0:
-        st.caption(f"Uploaded: {current_count}/20 images")
+        st.caption(f"Uploaded: {current_count}/{config.max_images} images")
 
     uploaded_files = st.file_uploader(
-        "Choose two or more images to find similar groups (max 20 images, 10MB each)",
+        f"Choose two or more images to find similar groups (max {config.max_images} images, {config.max_file_size_mb}MB each)",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
-        help="Supported formats: JPG, JPEG, PNG. Limits: 20 images maximum, 10MB per image.",
+        help=f"Supported formats: JPG, JPEG, PNG. Limits: {config.max_images} images maximum, {config.max_file_size_mb}MB per image.",
         key="file_uploader",
     )
 
     if uploaded_files:
+        # Track processed files to avoid duplicates
+        processed_names = {
+            img.name for img in st.session_state.app_state.uploaded_images
+        }
+
         for file in uploaded_files:
-            # Check file size (10MB = 10 * 1024 * 1024 bytes)
-            if file.size > 10 * 1024 * 1024:
-                st.error(f"⚠️ {file.name} exceeds 10MB limit. Skipping...")
+            # Check file size
+            if file.size > config.max_file_size_mb * 1024 * 1024:
+                st.error(
+                    f"⚠️ {file.name} exceeds {config.max_file_size_mb}MB limit. Skipping..."
+                )
                 continue
 
             # Check total image count
-            if len(st.session_state.uploaded_images) >= 20:
+            if len(st.session_state.app_state.uploaded_images) >= config.max_images:
                 st.warning(
-                    "⚠️ Maximum image limit (20) reached. Additional images will be ignored."
+                    f"⚠️ Maximum image limit ({config.max_images}) reached. Additional images will be ignored."
                 )
                 break
 
-            if file.name not in st.session_state.uploaded_images:
-                st.session_state.uploaded_images[file.name] = load_image(file)
+            # Only process new files
+            if file.name not in processed_names:
+                st.session_state.app_state.uploaded_images.append(
+                    ImageData(name=file.name, data=load_image(file))
+                )
+                st.session_state.app_state.last_updated = datetime.now()
 
     # Display grid of images
-    if st.session_state.uploaded_images:
+    if st.session_state.app_state.uploaded_images:
         cols = st.columns(4)
-        for idx, (name, img) in enumerate(st.session_state.uploaded_images.items()):
+        for idx, img in enumerate(st.session_state.app_state.uploaded_images):
             with cols[idx % 4]:
-                st.image(img, caption=name, use_container_width=True)
+                st.image(img.data, caption=img.name, use_container_width=True)
 
 
-def display_clustering_section():
+def perform_clustering(images: list[ImageData], threshold: int) -> None:
+    """Perform clustering on the provided images and update app state."""
+    images_dict = {img.name: img.data for img in images}
+    embedding_results = get_embeddings(images_dict)
+    clusters = cluster_images(embedding_results, threshold=threshold)
+    st.session_state.app_state.clusters = clusters
+    st.session_state.app_state.show_results = True
+    st.session_state.app_state.last_updated = datetime.now()
+    st.success(f"✅ Found {len(clusters)} groups of similar images!")
+    st.balloons()
+
+
+def display_clustering_section() -> None:
     """Render the clustering controls section.
 
     Shows clustering button and handles the clustering process.
@@ -162,47 +235,47 @@ def display_clustering_section():
     """
     st.subheader("2. Find Similar Groups")
 
-    if len(st.session_state.uploaded_images) < 2:
+    if len(st.session_state.app_state.uploaded_images) < 2:
         st.info("⚠️ Please upload at least 2 images to start clustering")
         st.button("Start Clustering", disabled=True)
         return
 
-    # Add threshold control
+    config = st.session_state.app_state.clustering_config
     threshold = st.slider(
         "Similarity Threshold",
         min_value=1000,
         max_value=10000,
-        value=5500,
+        value=config.threshold,
         step=500,
         help="Lower values create more groups, higher values create fewer groups. Adjust based on your needs.",
     )
+    config.threshold = threshold
 
     if st.button("Start Clustering", type="primary"):
         with st.spinner("🔍 Finding similar image groups..."):
-            embedding_results = get_embeddings(st.session_state.uploaded_images)
-            clusters = cluster_images(embedding_results, threshold=threshold)
-            st.session_state.clusters = clusters
-            st.session_state.show_results = True
-
-            # Display clustering results
-            st.success(f"✅ Found {len(clusters)} groups of similar images!")
-            st.balloons()
-            st.session_state.show_results = True
-            st.rerun()
+            perform_clustering(st.session_state.app_state.uploaded_images, threshold)
+        st.rerun()
 
 
-def display_results_section():
+def get_uploaded_image_by_name(name: str) -> NDArray:
+    for img in st.session_state.app_state.uploaded_images:
+        if img.name == name:
+            return img.data
+    raise ValueError(f"Image with name {name} not found in uploaded images.")
+
+
+def display_results_section() -> None:
     """Display clustering results in expandable sections.
 
     Shows grouped images in a grid layout within expandable containers.
     Only visible after clustering has been performed.
     """
-    if not st.session_state.show_results:
+    if not st.session_state.app_state.show_results:
         return
 
-    st.subheader(f"3. Results: {len(st.session_state.clusters)} Groups Found")
+    st.subheader(f"3. Results: {len(st.session_state.app_state.clusters)} Groups Found")
 
-    for cluster_id, image_files in st.session_state.clusters.items():
+    for cluster_id, image_files in st.session_state.app_state.clusters.items():
         with st.expander(
             f"Group {cluster_id} ({len(image_files)} images)", expanded=True
         ):
@@ -210,27 +283,21 @@ def display_results_section():
             for idx, img_name in enumerate(image_files):
                 with cols[idx % 4]:
                     st.image(
-                        st.session_state.uploaded_images[img_name],
+                        get_uploaded_image_by_name(img_name),
                         caption=img_name,
                         use_container_width=True,
                     )
 
 
-def display_reset_section():
-    """Render the reset controls section.
-
-    Provides functionality to clear all uploaded images and results,
-    allowing the user to start over.
-    """
+def display_reset_section() -> None:
+    """Render the reset controls section."""
     st.divider()
     if st.button("Delete All & Start Over", type="secondary"):
-        for key in ["uploaded_images", "clusters", "show_results"]:
-            if key in st.session_state:
-                del st.session_state[key]
+        st.session_state.app_state = AppState()  # Reset to fresh state
         st.rerun()
 
 
-def main():
+def main() -> None:
     """Main application entry point.
 
     Initializes the application, sets up the UI components,
@@ -239,12 +306,7 @@ def main():
     # Configure page and header
     setup_page()
     setup_header()
-
-    # Initialize session state for persistence
-    if "uploaded_images" not in st.session_state:
-        st.session_state.uploaded_images = {}
-    if "show_results" not in st.session_state:
-        st.session_state.show_results = False
+    init_session_state()
 
     # Render main application sections
     display_upload_section()
