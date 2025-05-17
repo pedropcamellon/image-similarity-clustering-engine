@@ -1,10 +1,10 @@
-from datetime import datetime
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from pydantic import ConfigDict, validate_call
-from models import AppState, ImageData
+from models import ImageData
 from numpy.typing import NDArray
+from pydantic import ConfigDict, validate_call
 from scipy.cluster.hierarchy import linkage, fcluster
+from state_manager import SessionStateManager, StateAction, StateUpdate
 from streamlit.runtime.uploaded_file_manager import UploadedFile
 import cv2
 import mediapipe as mp
@@ -42,11 +42,9 @@ def setup_header() -> None:
 
 
 def init_session_state() -> None:
-    """Initialize the application state with Pydantic models"""
-    if "app_state" not in st.session_state:
-        st.session_state.app_state = AppState()
-    elif not hasattr(st.session_state.app_state, "clustering_config"):
-        st.session_state.app_state = AppState()
+    """Initialize the application state"""
+    global state_manager
+    state_manager = SessionStateManager()
 
 
 @validate_call(config=ConfigDict(arbitrary_types_allowed=True))
@@ -165,8 +163,8 @@ def display_upload_section() -> None:
     """
     st.subheader("1. Upload Images")
 
-    config = st.session_state.app_state.clustering_config
-    current_count = len(st.session_state.app_state.uploaded_images)
+    config = state_manager.state.clustering_config
+    current_count = len(state_manager.state.uploaded_images)
 
     if current_count > 0:
         st.caption(f"Uploaded: {current_count}/{config.max_images} images")
@@ -181,9 +179,7 @@ def display_upload_section() -> None:
 
     if uploaded_files:
         # Track processed files to avoid duplicates
-        processed_names = {
-            img.name for img in st.session_state.app_state.uploaded_images
-        }
+        processed_names = {img.name for img in state_manager.state.uploaded_images}
 
         for file in uploaded_files:
             # Check file size
@@ -194,7 +190,7 @@ def display_upload_section() -> None:
                 continue
 
             # Check total image count
-            if len(st.session_state.app_state.uploaded_images) >= config.max_images:
+            if len(state_manager.state.uploaded_images) >= config.max_images:
                 st.warning(
                     f"⚠️ Maximum image limit ({config.max_images}) reached. Additional images will be ignored."
                 )
@@ -202,15 +198,17 @@ def display_upload_section() -> None:
 
             # Only process new files
             if file.name not in processed_names:
-                st.session_state.app_state.uploaded_images.append(
-                    ImageData(name=file.name, data=load_image(file))
+                state_manager.dispatch(
+                    StateUpdate(
+                        action=StateAction.ADD_IMAGE,
+                        payload=ImageData(name=file.name, data=load_image(file)),
+                    )
                 )
-                st.session_state.app_state.last_updated = datetime.now()
 
     # Display grid of images
-    if st.session_state.app_state.uploaded_images:
+    if state_manager.state.uploaded_images:
         cols = st.columns(4)
-        for idx, img in enumerate(st.session_state.app_state.uploaded_images):
+        for idx, img in enumerate(state_manager.state.uploaded_images):
             with cols[idx % 4]:
                 st.image(img.data, caption=img.name, use_container_width=True)
 
@@ -220,9 +218,13 @@ def perform_clustering(images: list[ImageData], threshold: int) -> None:
     images_dict = {img.name: img.data for img in images}
     embedding_results = get_embeddings(images_dict)
     clusters = cluster_images(embedding_results, threshold=threshold)
-    st.session_state.app_state.clusters = clusters
-    st.session_state.app_state.show_results = True
-    st.session_state.app_state.last_updated = datetime.now()
+    state_manager.dispatch(
+        StateUpdate(action=StateAction.SET_CLUSTERS, payload=clusters)
+    )
+    state_manager.dispatch(
+        StateUpdate(action=StateAction.SET_SHOW_RESULTS, payload=True)
+    )
+
     st.success(f"✅ Found {len(clusters)} groups of similar images!")
     st.balloons()
 
@@ -235,12 +237,12 @@ def display_clustering_section() -> None:
     """
     st.subheader("2. Find Similar Groups")
 
-    if len(st.session_state.app_state.uploaded_images) < 2:
+    if len(state_manager.state.uploaded_images) < 2:
         st.info("⚠️ Please upload at least 2 images to start clustering")
         st.button("Start Clustering", disabled=True)
         return
 
-    config = st.session_state.app_state.clustering_config
+    config = state_manager.state.clustering_config
     threshold = st.slider(
         "Similarity Threshold",
         min_value=1000,
@@ -253,12 +255,12 @@ def display_clustering_section() -> None:
 
     if st.button("Start Clustering", type="primary"):
         with st.spinner("🔍 Finding similar image groups..."):
-            perform_clustering(st.session_state.app_state.uploaded_images, threshold)
+            perform_clustering(state_manager.state.uploaded_images, threshold)
         st.rerun()
 
 
 def get_uploaded_image_by_name(name: str) -> NDArray:
-    for img in st.session_state.app_state.uploaded_images:
+    for img in state_manager.state.uploaded_images:
         if img.name == name:
             return img.data
     raise ValueError(f"Image with name {name} not found in uploaded images.")
@@ -270,12 +272,17 @@ def display_results_section() -> None:
     Shows grouped images in a grid layout within expandable containers.
     Only visible after clustering has been performed.
     """
-    if not st.session_state.app_state.show_results:
+    if not state_manager.state.show_results:
         return
 
-    st.subheader(f"3. Results: {len(st.session_state.app_state.clusters)} Groups Found")
+    if state_manager.state.clusters is None:
+        st.warning("No clusters found. Please try again.")
+        return
 
-    for cluster_id, image_files in st.session_state.app_state.clusters.items():
+    st.subheader("3. Results")
+    st.write(f"{len(state_manager.state.clusters)} Groups Found")
+
+    for cluster_id, image_files in state_manager.state.clusters.items():
         with st.expander(
             f"Group {cluster_id} ({len(image_files)} images)", expanded=True
         ):
@@ -293,7 +300,7 @@ def display_reset_section() -> None:
     """Render the reset controls section."""
     st.divider()
     if st.button("Delete All & Start Over", type="secondary"):
-        st.session_state.app_state = AppState()  # Reset to fresh state
+        state_manager.dispatch(StateUpdate(action=StateAction.RESET, payload=None))
         st.rerun()
 
 
